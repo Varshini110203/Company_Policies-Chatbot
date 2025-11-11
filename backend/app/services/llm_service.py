@@ -44,18 +44,37 @@ class LLMService:
         version_context: str = "",
         search_results_metadata: List[Dict] = None,
     ) -> str:
-        """Build prompt emphasizing document versions and recency"""
-
-        # --- Limit context size for safety ---
-        max_chunks = 8
-        max_chunk_length = 1000
+        """Build optimized prompt with size limits"""
+        
+        # --- More aggressive limits ---
+        max_chunks = 3  # Reduced from 8 to 3
+        max_chunk_length = 800  # Reduced from 1000 to 800
+        max_total_chars = 12000  # More conservative limit
 
         context_texts = []
         version_mentions = []
 
-        for i, doc in enumerate(context[:max_chunks]):
+        # Sort by relevance and take top chunks
+        sorted_context = sorted(context, key=lambda x: x[1] if len(x) > 1 else 0, reverse=True)
+        
+        for i, doc in enumerate(sorted_context[:max_chunks]):
             if isinstance(doc, tuple) and len(doc) > 0:
-                content = self._extract_text_from_context(doc[0])[:max_chunk_length]
+                content = self._extract_text_from_context(doc[0])
+                
+                # More aggressive truncation
+                if len(content) > max_chunk_length:
+                    # Try to keep the most relevant part
+                    sentences = content.split('.')
+                    compressed_content = []
+                    current_length = 0
+                    for sentence in sentences:
+                        if current_length + len(sentence) < max_chunk_length:
+                            compressed_content.append(sentence)
+                            current_length += len(sentence)
+                        else:
+                            break
+                    content = '. '.join(compressed_content) + '.'
+                
                 similarity = doc[1] if len(doc) > 1 else 0.0
 
                 source_info = ""
@@ -66,56 +85,90 @@ class LLMService:
                     is_recent = metadata.get("is_most_recent", False)
 
                     if is_recent:
-                        source_info = f"\n[SOURCE: {doc_name} - LATEST VERSION - Modified: {modified_date}]"
+                        source_info = f"\n[SOURCE: {doc_name} - LATEST - {modified_date}]"
                     else:
-                        source_info = f"\n[SOURCE: {doc_name} - OLDER VERSION - Modified: {modified_date}]"
+                        source_info = f"\n[SOURCE: {doc_name} - {modified_date}]"
 
                     version_mentions.append(f"- {doc_name} (Modified: {modified_date})")
 
                 context_texts.append(
                     f"Content {i+1} (Relevance: {similarity:.2f}):{source_info}\n{content}"
                 )
-            else:
-                content = self._extract_text_from_context(doc)
-                context_texts.append(f"Content: {content[:max_chunk_length]}")
 
         context_str = "\n\n" + "\n\n".join(context_texts)
 
+        # Simplify version summary
         version_summary = ""
         if version_mentions:
-            version_summary = (
-                "Documents found in search:\n" + "\n".join(version_mentions)
-            )
+            version_summary = "Relevant documents:\n" + "\n".join(version_mentions[:3])  # Limit to 3
 
-        prompt = f"""You are a helpful HR policy assistant. Answer the user's question concisely using only the content below.
+        # More concise prompt template
+        prompt = f"""Answer the question using the document context below.
 
-USER QUESTION:
-{query}
+    QUESTION: {query}
 
-{version_summary}
+    {version_summary}
 
-RELEVANT CONTENT FROM DOCUMENTS:
-{context_str}
+    DOCUMENT CONTEXT:{context_str}
 
-VERSION CONTEXT:
-{version_context}
+    INSTRUCTIONS:
+    - Use only the provided document context
+    - Be concise and accurate
+    - If information is missing, say so clearly
+    """
 
-CRITICAL INSTRUCTIONS:
-1. Focus only on the provided document context.
-2. If multiple versions exist, prefer the latest, but note key differences if visible.
-3. Be concise, professional, and accurate.
-4. If something isn’t in the documents, say it clearly.
-"""
+        # --- Smart truncation instead of blind cutting ---
+        if len(prompt) > max_total_chars:
+            logger.warning(f"⚠️ Prompt too large ({len(prompt)} chars). Optimizing...")
+            
+            # Remove less important sections first
+            if len(context_str) > 6000:
+                # Truncate least relevant chunks first
+                context_str = self._truncate_context_smartly(context_str, max_total_chars - 2000)
+            
+            # Rebuild prompt with truncated context
+            prompt = f"""Answer the question using the document context below.
 
-        # --- Prompt size guardrail ---
-        if len(prompt) > 15000:
-            logger.warning(
-                f"⚠️ Prompt too large ({len(prompt)} chars). Truncating to 15,000 chars."
-            )
-            prompt = prompt[:15000] + "\n\n[Truncated to fit API limit]"
+    QUESTION: {query}
+
+    DOCUMENT CONTEXT:{context_str}
+
+    INSTRUCTIONS:
+    - Use only the provided document context
+    - Be concise and accurate
+    - If information is missing, say so clearly
+    """
 
         return prompt
 
+    def _truncate_context_smartly(self, context_str: str, max_length: int) -> str:
+        """Smart context truncation preserving most relevant parts"""
+        chunks = context_str.split('\n\n')
+        
+        # Keep most relevant chunks (those with higher relevance scores)
+        kept_chunks = []
+        current_length = 0
+        
+        for chunk in chunks:
+            chunk_length = len(chunk)
+            if current_length + chunk_length <= max_length:
+                kept_chunks.append(chunk)
+                current_length += chunk_length
+            else:
+                # Try to truncate this chunk
+                lines = chunk.split('\n')
+                kept_lines = []
+                for line in lines:
+                    if current_length + len(line) <= max_length:
+                        kept_lines.append(line)
+                        current_length += len(line)
+                    else:
+                        break
+                if kept_lines:
+                    kept_chunks.append('\n'.join(kept_lines))
+                break
+        
+        return '\n\n'.join(kept_chunks)
     def generate_response(
         self,
         query: str,
