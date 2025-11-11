@@ -14,7 +14,8 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 class DocumentProcessor:
-    def __init__(self):
+    def __init__(self, region: str = "india"):
+        self.region = region.lower()
         self.embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL)
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -23,12 +24,28 @@ class DocumentProcessor:
         )
         self.vector_store = None
         self.documents = []
-        self.chunk_sources = []  # Track which document each chunk comes from
+        self.chunk_sources = []
         self.document_versions = {}
         self._initialized = False
 
+    # ---------------- PATHS ----------------
+    def _get_paths(self):
+        base_docs = os.path.join(settings.DOCUMENTS_PATH, self.region)
+        base_vector = os.path.join(settings.VECTOR_STORE_PATH, self.region)
+        os.makedirs(base_vector, exist_ok=True)
+        return base_docs, base_vector
+
+    # ---------------- PDF SCAN ----------------
+    def _get_all_pdfs(self, root_path: str) -> List[str]:
+        pdf_files = []
+        for dirpath, _, filenames in os.walk(root_path):
+            for f in filenames:
+                if f.lower().endswith(".pdf"):
+                    pdf_files.append(os.path.join(dirpath, f))
+        return pdf_files
+
+    # ---------------- PDF READER ----------------
     def extract_document_content(self, file_path: str) -> Dict[str, Any]:
-        """Extract content and metadata from a PDF file."""
         try:
             with open(file_path, "rb") as f:
                 pdf = PyPDF2.PdfReader(f)
@@ -60,136 +77,73 @@ class DocumentProcessor:
             logger.error(f"Error reading PDF {file_path}: {str(e)}")
             return None
 
-    def _vector_store_is_up_to_date(self) -> bool:
-        """Check if existing vector store matches current document folder state."""
-        index_path = os.path.join(settings.VECTOR_STORE_PATH, "faiss.index")
-        versions_path = os.path.join(settings.VECTOR_STORE_PATH, "versions.pkl")
-        chunk_sources_path = os.path.join(settings.VECTOR_STORE_PATH, "chunk_sources.pkl")
-        documents_path = settings.DOCUMENTS_PATH
-
-        if not os.path.exists(index_path) or not os.path.exists(versions_path) or not os.path.exists(chunk_sources_path):
-            return False
-
-        try:
-            with open(versions_path, "rb") as f:
-                stored_versions = pickle.load(f)
-
-            # Current folder PDFs
-            current_files = {
-                f: os.path.getmtime(os.path.join(documents_path, f))
-                for f in os.listdir(documents_path)
-                if f.endswith(".pdf")
-            }
-
-            if not current_files:
-                return False
-
-            stored_files = {
-                info["filename"]: info["modified_time"] for info in stored_versions.values()
-            }
-
-            # Added or removed PDFs
-            if set(current_files.keys()) != set(stored_files.keys()):
-                return False
-
-            # Modified PDFs
-            for fname, mtime in current_files.items():
-                if abs(mtime - stored_files.get(fname, 0)) > 1:
-                    return False
-
-            return True
-
-        except Exception as e:
-            logger.warning(f"Vector store freshness check failed: {str(e)}")
-            return False
-
+    # ---------------- LOAD + SPLIT ----------------
     def load_documents(self) -> List[str]:
-        """Load and split PDF documents from the documents directory."""
-        documents_path = settings.DOCUMENTS_PATH
+        documents_path, _ = self._get_paths()
         all_texts = []
 
-        os.makedirs(documents_path, exist_ok=True)
-        pdf_files = [f for f in os.listdir(documents_path) if f.endswith(".pdf")]
-
+        pdf_files = self._get_all_pdfs(documents_path)
         if not pdf_files:
-            logger.warning(f"No PDF files found in {documents_path}")
+            logger.warning(f"No PDFs found under {documents_path}")
             return []
 
-        logger.info(f"Found {len(pdf_files)} PDF files: {pdf_files}")
-
         all_documents = []
-        for filename in pdf_files:
-            file_path = os.path.join(documents_path, filename)
+        for file_path in pdf_files:
             doc_data = self.extract_document_content(file_path)
             if doc_data:
                 all_documents.append(doc_data)
-                logger.info(f"Extracted {filename} ({doc_data['page_count']} pages)")
+                logger.info(f"Extracted {doc_data['filename']} ({doc_data['page_count']} pages)")
 
-        if not all_documents:
-            return []
+        self.document_versions = {doc["filename"]: doc for doc in all_documents}
 
-        # Save version info
-        self.document_versions = {
-            doc["filename"]: doc for doc in all_documents
-        }
-
-        # Split documents and track sources
         for doc in all_documents:
             chunks = self.text_splitter.split_text(doc["content"])
             all_texts.extend(chunks)
-            # Track which document each chunk comes from
             for chunk in chunks:
                 self.chunk_sources.append(doc["filename"])
             logger.info(f"Split {doc['filename']} into {len(chunks)} chunks")
 
-        logger.info(f"Total {len(all_texts)} text chunks from {len(all_documents)} documents")
+        logger.info(f"✅ Total {len(all_texts)} text chunks from {len(all_documents)} {self.region.upper()} documents")
         return all_texts
 
+    # ---------------- EMBEDDINGS ----------------
     def create_embeddings(self, texts: List[str]) -> np.ndarray:
         if not texts:
-            logger.warning("No texts to create embeddings for")
+            logger.warning("No text to embed.")
             return np.array([])
+        logger.info(f"Creating embeddings for {len(texts)} chunks ({self.region.upper()})")
+        return self.embedding_model.encode(texts, show_progress_bar=False)
 
-        logger.info(f"Creating embeddings for {len(texts)} chunks")
-        embeddings = self.embedding_model.encode(texts, show_progress_bar=False)
-        logger.info(f"Embeddings created: {embeddings.shape}")
-        return embeddings
-
+    # ---------------- BUILD VECTOR STORE ----------------
     def build_vector_store(self, texts: List[str], embeddings: np.ndarray):
-        if len(texts) == 0 or embeddings.shape[0] == 0:
-            logger.warning("No texts or embeddings to build vector store")
-            return
-
+        _, vector_path = self._get_paths()
         dim = embeddings.shape[1]
         self.vector_store = faiss.IndexFlatL2(dim)
         self.vector_store.add(embeddings.astype(np.float32))
         self.documents = texts
 
-        # Store chunk sources
-        os.makedirs(settings.VECTOR_STORE_PATH, exist_ok=True)
-        faiss.write_index(self.vector_store, os.path.join(settings.VECTOR_STORE_PATH, "faiss.index"))
-
-        with open(os.path.join(settings.VECTOR_STORE_PATH, "documents.pkl"), "wb") as f:
+        # Save FAISS + metadata
+        faiss.write_index(self.vector_store, os.path.join(vector_path, "faiss.index"))
+        with open(os.path.join(vector_path, "documents.pkl"), "wb") as f:
             pickle.dump(texts, f)
-            
-        with open(os.path.join(settings.VECTOR_STORE_PATH, "chunk_sources.pkl"), "wb") as f:
+        with open(os.path.join(vector_path, "chunk_sources.pkl"), "wb") as f:
             pickle.dump(self.chunk_sources, f)
-
-        with open(os.path.join(settings.VECTOR_STORE_PATH, "versions.pkl"), "wb") as f:
+        with open(os.path.join(vector_path, "versions.pkl"), "wb") as f:
             pickle.dump(self.document_versions, f)
 
         self._initialized = True
-        logger.info(f"✅ Vector store built with {len(texts)} chunks")
+        logger.info(f"✅ Built FAISS vector store for {self.region.upper()} with {len(texts)} chunks")
 
+    # ---------------- LOAD EXISTING ----------------
     def load_vector_store(self) -> bool:
-        index_path = os.path.join(settings.VECTOR_STORE_PATH, "faiss.index")
-        docs_path = os.path.join(settings.VECTOR_STORE_PATH, "documents.pkl")
-        chunk_sources_path = os.path.join(settings.VECTOR_STORE_PATH, "chunk_sources.pkl")
-        versions_path = os.path.join(settings.VECTOR_STORE_PATH, "versions.pkl")
+        _, vector_path = self._get_paths()
+        index_path = os.path.join(vector_path, "faiss.index")
+        docs_path = os.path.join(vector_path, "documents.pkl")
+        chunk_sources_path = os.path.join(vector_path, "chunk_sources.pkl")
+        versions_path = os.path.join(vector_path, "versions.pkl")
 
-        if not (os.path.exists(index_path) and os.path.exists(docs_path) and os.path.exists(chunk_sources_path)):
+        if not (os.path.exists(index_path) and os.path.exists(docs_path)):
             return False
-
         try:
             self.vector_store = faiss.read_index(index_path)
             with open(docs_path, "rb") as f:
@@ -200,174 +154,64 @@ class DocumentProcessor:
                 with open(versions_path, "rb") as f:
                     self.document_versions = pickle.load(f)
             self._initialized = True
-            logger.info("✅ Loaded existing FAISS vector store")
+            logger.info(f"✅ Loaded existing FAISS vector store for {self.region.upper()}")
             return True
         except Exception as e:
-            logger.error(f"Failed to load vector store: {str(e)}")
+            logger.error(f"Error loading FAISS for {self.region.upper()}: {e}")
             return False
 
+    # ---------------- INITIALIZE ----------------
     def initialize_vector_store(self):
-        logger.info("Initializing vector store...")
-
-        if self._vector_store_is_up_to_date():
-            if self.load_vector_store():
-                logger.info("✅ Vector store is up-to-date — using existing files.")
-                return
-
-        logger.info("⚙️ Rebuilding vector store due to new or modified documents...")
+        if self.load_vector_store():
+            return
         texts = self.load_documents()
         if texts:
             embeddings = self.create_embeddings(texts)
             if embeddings.size > 0:
                 self.build_vector_store(texts, embeddings)
-                logger.info("✅ Vector store rebuilt successfully")
-            else:
-                logger.error("Embedding generation failed.")
-        else:
-            logger.warning("No documents found for vector store rebuild.")
-            self._initialized = False
 
-    def search_similar(self, query: str, k: int = 5) -> Tuple[List[Tuple[str, float]], List[Dict]]:
-        """
-        Search for similar documents with metadata about source documents
-        Returns: (results, metadata) where results are (content, confidence_score) tuples
-        """
-        if not self._initialized or self.vector_store is None or not self.documents:
-            logger.error("Vector store not ready for search.")
-            return [], []
-
-        try:
-            query_vec = self.embedding_model.encode([query])
-            distances, indices = self.vector_store.search(query_vec.astype(np.float32), k*2)
-            
-            # Get the most recent document
-            recent_doc_name = None
-            if self.document_versions:
-                recent_doc = max(self.document_versions.values(), key=lambda x: x["modified_time"])
-                recent_doc_name = recent_doc["filename"]
-            
-            # Process all results
-            all_results = []
-            all_metadata = []
-            
-            for i, idx in enumerate(indices[0]):
-                if 0 <= idx < len(self.documents):
-                    # Convert numpy float to Python float
-                    similarity = float(1.0 / (1.0 + distances[0][i]))
-                    content = self.documents[idx]
-                    all_results.append((content, similarity))
-                    
-                    # Get document metadata for this chunk
-                    doc_name = self.chunk_sources[idx] if idx < len(self.chunk_sources) else "Unknown"
-                    doc_info = self.document_versions.get(doc_name, {})
-                    
-                    metadata = {
-                        'document_name': doc_name,
-                        'modified_date': doc_info.get('modified_date', 'Unknown'),
-                        'is_most_recent': doc_name == recent_doc_name,
-                        'similarity_score': similarity  # Already Python float
-                    }
-                    all_metadata.append(metadata)
-            
-            # Separate recent and older results
-            recent_results = []
-            recent_metadata = []
-            other_results = []
-            other_metadata = []
-            
-            for result, metadata in zip(all_results, all_metadata):
-                if metadata['is_most_recent']:
-                    recent_results.append(result)
-                    recent_metadata.append(metadata)
-                else:
-                    other_results.append(result)
-                    other_metadata.append(metadata)
-            
-            # Prioritize recent document results but include some older ones for comparison
-            final_results = []
-            final_metadata = []
-            
-            # Add recent results first
-            if recent_results:
-                final_results.extend(recent_results[:min(3, len(recent_results))])
-                final_metadata.extend(recent_metadata[:min(3, len(recent_metadata))])
-            
-            # Add older results for context
-            remaining_slots = k - len(final_results)
-            if remaining_slots > 0 and other_results:
-                final_results.extend(other_results[:remaining_slots])
-                final_metadata.extend(other_metadata[:remaining_slots])
-            
-            return final_results, final_metadata
-            
-        except Exception as e:
-            logger.error(f"Search failed: {str(e)}")
-            return [], []
+    # ---------------- STATUS + CONTEXT ----------------
+    def is_initialized(self) -> bool:
+        return getattr(self, "_initialized", False)
 
     def get_status(self) -> dict:
         return {
-            "initialized": self._initialized,
-            "documents_loaded": len(self.documents),
-            "vector_store_ready": self.vector_store is not None,
+            "initialized": getattr(self, "_initialized", False),
             "document_count": len(self.document_versions),
+            "documents_loaded": len(self.documents)
         }
 
-    def is_initialized(self) -> bool:
-        return self._initialized
-
     def get_version_context(self) -> str:
-        """Get a detailed description of document versions for the LLM"""
         if not self.document_versions:
-            return "No documents found in the system."
-
-        # Sort documents by modification time (newest first)
-        sorted_docs = sorted(self.document_versions.values(), 
-                           key=lambda x: x["modified_time"], 
-                           reverse=True)
-        
-        version_info = []
-        for i, doc in enumerate(sorted_docs):
-            recency_indicator = " (MOST RECENT)" if i == 0 else " (OLDER VERSION)"
-            version_info.append(
-                f"• {doc['filename']}{recency_indicator}\n"
-                f"  - Modified: {doc.get('modified_date', 'Unknown')}\n"
-                f"  - Pages: {doc.get('page_count', 'Unknown')}\n"
-                f"  - Size: {doc.get('file_size', 0) / 1024:.1f} KB"
-            )
-        
-        summary = "\n\n".join(version_info)
-        
-        return (
-            f"DOCUMENT VERSION CONTEXT:\n"
-            f"Total documents: {len(sorted_docs)}\n"
-            f"Documents sorted by modification date (newest first):\n\n"
-            f"{summary}"
+            return "No version context available."
+        return "\n".join(
+            f"{name} (Modified: {info.get('modified_date', 'Unknown')})"
+            for name, info in self.document_versions.items()
         )
 
-    def get_all_versions_for_topic(self, topic: str) -> List[Dict]:
-        """Get all document versions that contain information about a specific topic"""
-        if not self._initialized:
-            return []
-        
-        # Search for the topic across all documents
-        results, metadata = self.search_similar(topic, k=10)
-        
-        # Group results by document
-        doc_results = {}
-        for result, meta in zip(results, metadata):
-            doc_name = meta['document_name']
-            if doc_name not in doc_results:
-                doc_info = self.document_versions.get(doc_name, {})
-                doc_results[doc_name] = {
-                    'document_name': doc_name,
-                    'modified_date': doc_info.get('modified_date', 'Unknown'),
-                    'is_most_recent': meta['is_most_recent'],
-                    'content_snippets': [],
-                    'max_similarity': 0.0
-                }
-            
-            content, similarity = result
-            doc_results[doc_name]['content_snippets'].append(content)
-            doc_results[doc_name]['max_similarity'] = max(doc_results[doc_name]['max_similarity'], similarity)
-        
-        return list(doc_results.values())
+    # ---------------- SEARCH ----------------
+    def search_similar(self, query: str, top_k: int = 5):
+        """Search similar chunks using FAISS."""
+        if not self._initialized or self.vector_store is None:
+            raise ValueError(f"FAISS index not initialized for {self.region.upper()} region.")
+
+        query_embedding = self.embedding_model.encode([query])
+        query_embedding = np.array(query_embedding).astype("float32")
+
+        distances, indices = self.vector_store.search(query_embedding, top_k)
+        distances, indices = distances[0], indices[0]
+
+        results, metadata = [], []
+        for idx, dist in zip(indices, distances):
+            if 0 <= idx < len(self.documents):
+                content = self.documents[idx]
+                similarity = float(np.exp(-dist))  # Convert L2 distance to similarity
+                results.append((content, similarity))
+                filename = self.chunk_sources[idx] if idx < len(self.chunk_sources) else "Unknown"
+                info = self.document_versions.get(filename, {})
+                metadata.append({
+                    "document_name": filename,
+                    "modified_date": info.get("modified_date", "Unknown"),
+                    "is_most_recent": True
+                })
+        return results, metadata
