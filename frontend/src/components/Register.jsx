@@ -11,23 +11,97 @@ const Register = () => {
   });
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [fieldErrors, setFieldErrors] = useState({
+    username: '',
+    email: '',
+    password: '',
+    confirmPassword: '',
+  });
   
   const { register } = useAuth();
   const navigate = useNavigate();
 
+  const validateForm = () => {
+    const errors = {};
+    let isValid = true;
+
+    // Username validation
+    if (!formData.username.trim()) {
+      errors.username = 'Username is required';
+      isValid = false;
+    } else if (formData.username.length < 3) {
+      errors.username = 'Username must be at least 3 characters long';
+      isValid = false;
+    } else if (!/^[a-zA-Z0-9_]+$/.test(formData.username)) {
+      errors.username = 'Username can only contain letters, numbers, and underscores';
+      isValid = false;
+    }
+
+    // Email validation
+    if (!formData.email.trim()) {
+      errors.email = 'Email is required';
+      isValid = false;
+    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.email)) {
+      errors.email = 'Please enter a valid email address (e.g., name@example.com)';
+      isValid = false;
+    }
+
+    // Password validation
+    if (!formData.password) {
+      errors.password = 'Password is required';
+      isValid = false;
+    } else if (formData.password.length < 6) {
+      errors.password = 'Password must be at least 6 characters long';
+      isValid = false;
+    } else if (!/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(formData.password)) {
+      errors.password = 'Password must contain at least one uppercase letter, one lowercase letter, and one number';
+      isValid = false;
+    }
+
+    // Confirm password validation
+    if (!formData.confirmPassword) {
+      errors.confirmPassword = 'Please confirm your password';
+      isValid = false;
+    } else if (formData.password !== formData.confirmPassword) {
+      errors.confirmPassword = 'Passwords do not match';
+      isValid = false;
+    }
+
+    setFieldErrors(errors);
+    return isValid;
+  };
+
+  const clearFieldError = (fieldName) => {
+    setFieldErrors({
+      ...fieldErrors,
+      [fieldName]: '',
+    });
+  };
+
   const handleChange = (e) => {
+    const { name, value } = e.target;
     setFormData({
       ...formData,
-      [e.target.name]: e.target.value,
+      [name]: value,
     });
+    
+    // Clear field-specific error when user starts typing
+    if (fieldErrors[name]) {
+      clearFieldError(name);
+    }
+    
+    // Clear general error when user makes any change
+    if (error) {
+      setError('');
+    }
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
 
-    if (formData.password !== formData.confirmPassword) {
-      setError('Passwords do not match');
+    // Validate all fields
+    if (!validateForm()) {
       return;
     }
 
@@ -47,11 +121,21 @@ const Register = () => {
     }
   };
 
+  const getInputClassName = (fieldName) => {
+    const baseClass = "w-full px-3 py-2 text-sm border rounded-lg placeholder-gray-400 focus:outline-none focus:ring-1 transition-all duration-200";
+    
+    if (fieldErrors[fieldName]) {
+      return `${baseClass} border-red-300 focus:ring-red-500 focus:border-red-500 bg-red-50`;
+    }
+    
+    return `${baseClass} border-gray-300 focus:ring-blue-500 focus:border-blue-500`;
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-purple-50 flex items-center justify-center p-4">
-      <div className="w-full max-w-sm"> {/* Reduced max-width */}
+      <div className="w-full max-w-sm">
         {/* Header */}
-        <div className="text-center mb-6"> {/* Reduced margin */}
+        <div className="text-center mb-6">
           <div className="w-12 h-12 bg-gradient-to-r from-blue-500 to-purple-500 rounded-xl flex items-center justify-center mx-auto mb-3 shadow-lg">
             <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
@@ -62,8 +146,8 @@ const Register = () => {
         </div>
 
         {/* Form */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4"> {/* Reduced padding */}
-          <form className="space-y-3" onSubmit={handleSubmit}> {/* Reduced spacing */}
+        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+          <form className="space-y-3" onSubmit={handleSubmit}>
             {error && (
               <div className="bg-red-50 border border-red-200 text-red-600 px-3 py-2 rounded-lg text-xs">
                 {error}
@@ -82,9 +166,12 @@ const Register = () => {
                 required
                 value={formData.username}
                 onChange={handleChange}
-                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200"
+                className={getInputClassName('username')}
                 placeholder="Enter your username"
               />
+              {fieldErrors.username && (
+                <p className="mt-1 text-xs text-red-600">{fieldErrors.username}</p>
+              )}
             </div>
 
             {/* Email Section */}
@@ -99,9 +186,12 @@ const Register = () => {
                 required
                 value={formData.email}
                 onChange={handleChange}
-                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200"
+                className={getInputClassName('email')}
                 placeholder="Enter your email"
               />
+              {fieldErrors.email && (
+                <p className="mt-1 text-xs text-red-600">{fieldErrors.email}</p>
+              )}
             </div>
 
             {/* Password Section */}
@@ -116,9 +206,13 @@ const Register = () => {
                 required
                 value={formData.password}
                 onChange={handleChange}
-                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200"
+                className={getInputClassName('password')}
                 placeholder="Create a password"
               />
+              {fieldErrors.password && (
+                <p className="mt-1 text-xs text-red-600">{fieldErrors.password}</p>
+              )}
+             
             </div>
 
             {/* Confirm Password Section */}
@@ -133,9 +227,12 @@ const Register = () => {
                 required
                 value={formData.confirmPassword}
                 onChange={handleChange}
-                className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200"
+                className={getInputClassName('confirmPassword')}
                 placeholder="Confirm your password"
               />
+              {fieldErrors.confirmPassword && (
+                <p className="mt-1 text-xs text-red-600">{fieldErrors.confirmPassword}</p>
+              )}
             </div>
 
             <button

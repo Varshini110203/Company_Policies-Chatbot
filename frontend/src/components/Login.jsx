@@ -28,11 +28,11 @@ const Login = () => {
     setLoading(true);
 
     // Basic email validation
-    if (!formData.email.includes("@")) {
-      setError("Please enter a valid email address");
-      setLoading(false);
-      return;
-    }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.email)) {
+    setError("Please enter a valid email address (e.g., name@example.com)");
+    setLoading(false);
+    return;
+  }
 
     try {
       await login(formData.email, formData.password);
